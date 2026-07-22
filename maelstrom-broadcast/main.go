@@ -4,15 +4,24 @@ import (
 	"encoding/json"
 	"log"
 	"os"
+	"sync"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
+type empty struct{}
+
 func main() {
+	var mu sync.Mutex
 	messages := make([]int, 0, 100)
-	var neighbors []string
+	neighbors := make([]string, 0, 100)
+	seen := make(map[int]empty)
 
 	n := maelstrom.NewNode()
+
+	n.Handle("broadcast_ok", func(msg maelstrom.Message) error {
+		return nil
+	})
 
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
 		// Unmarshal the message body as a loosely-typed map.
@@ -22,27 +31,23 @@ func main() {
 		}
 
 		var message int = int(body["message"].(float64))
-		for _, nei := range neighbors {
-			n.Send(nei, map[string]any{"type": "broadcast", "message": message})
-		}
 
-		messages = append(messages, message)
-		body["type"] = "broadcast_ok"
-		delete(body, "message")
-		return n.Reply(msg, body)
+		mu.Lock()
+		_, exists := seen[message]
+
+		if !exists {
+			seen[message] = empty{}
+			messages = append(messages, message)
+			for _, nei := range neighbors {
+				go n.Send(nei, map[string]any{"type": "broadcast", "message": message})
+			}
+		}
+		mu.Unlock()
+		return n.Reply(msg, map[string]any{"type": "broadcast_ok"})
 	})
 
 	n.Handle("read", func(msg maelstrom.Message) error {
-		// Unmarshal the message body as a loosely-typed map.
-		var body map[string]any
-		if err := json.Unmarshal(msg.Body, &body); err != nil {
-			return err
-		}
-
-		body["type"] = "read_ok"
-		body["messages"] = messages
-
-		return n.Reply(msg, body)
+		return n.Reply(msg, map[string]any{"type": "read_ok", "messages": messages})
 	})
 
 	n.Handle("topology", func(msg maelstrom.Message) error {
@@ -59,10 +64,7 @@ func main() {
 		for i, v := range neighborsRaw {
 			neighbors[i] = v.(string)
 		}
-
-		body["type"] = "topology_ok"
-		delete(body, "topology")
-		return n.Reply(msg, body)
+		return n.Reply(msg, map[string]any{"type": "topology_ok"})
 	})
 
 	// Execute the node's message loop. This will run until STDIN is closed.
