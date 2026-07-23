@@ -1,21 +1,24 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"os"
 	"sync"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
 type empty struct{}
+type set map[int]empty
 
 func main() {
 	var mu sync.Mutex
 	messages := make([]int, 0, 100)
 	neighbors := make([]string, 0, 100)
-	seen := make(map[int]empty)
+	seen := make(set)
 
 	n := maelstrom.NewNode()
 
@@ -38,8 +41,28 @@ func main() {
 		if !exists {
 			seen[message] = empty{}
 			messages = append(messages, message)
+
 			for _, nei := range neighbors {
-				go n.Send(nei, map[string]any{"type": "broadcast", "message": message})
+				go func() {
+					dest := nei
+					for {
+						ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+
+						_, err := n.SyncRPC(ctx, dest, map[string]any{
+							"type":    "broadcast",
+							"message": message,
+						})
+
+						cancel()
+
+						if err == nil {
+							break
+						}
+
+						time.Sleep(500 * time.Millisecond)
+					}
+				}()
+
 			}
 		}
 		mu.Unlock()
