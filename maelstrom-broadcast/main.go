@@ -1,10 +1,10 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"log"
 	"os"
+	"slices"
 	"sync"
 	"time"
 
@@ -14,84 +14,199 @@ import (
 type empty struct{}
 type set map[int]empty
 
-func main() {
-	var mu sync.Mutex
-	messages := make([]int, 0, 100)
-	neighbors := make([]string, 0, 100)
-	seen := make(set)
+type neighborBatcher struct {
+	dest        string
+	messageChan chan int
+}
 
-	n := maelstrom.NewNode()
+func newNeighborBatcher(node *maelstrom.Node, dest string) *neighborBatcher {
+	nb := &neighborBatcher{dest: dest, messageChan: make(chan int, 32)}
+	go nb.run(node)
+	return nb
+}
 
-	n.Handle("broadcast_ok", func(msg maelstrom.Message) error {
-		return nil
-	})
+func (nb *neighborBatcher) run(node *maelstrom.Node) {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
 
-	n.Handle("broadcast", func(msg maelstrom.Message) error {
-		// Unmarshal the message body as a loosely-typed map.
-		var body map[string]any
-		if err := json.Unmarshal(msg.Body, &body); err != nil {
-			return err
-		}
+	pending := make([]int, 0, 100)
 
-		var message int = int(body["message"].(float64))
+	for {
+		select {
+		case message := <-nb.messageChan:
+			pending = append(pending, message)
+			if len(pending) >= 32 {
+				batch := pending
+				pending = make([]int, 0, 100)
 
-		mu.Lock()
-		_, exists := seen[message]
+				// Reset the ticker so we don't fire an empty batch right after
+				ticker.Reset(10 * time.Millisecond)
 
-		if !exists {
-			seen[message] = empty{}
-			messages = append(messages, message)
-
-			for _, nei := range neighbors {
-				go func() {
-					dest := nei
-					for {
-						ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-
-						_, err := n.SyncRPC(ctx, dest, map[string]any{
-							"type":    "broadcast",
-							"message": message,
-						})
-
-						cancel()
-
-						if err == nil {
-							break
-						}
-
-						time.Sleep(500 * time.Millisecond)
-					}
-				}()
-
+				go func(b []int) {
+					node.Send(nb.dest, map[string]any{
+						"type":    "broadcast_batch",
+						"message": b,
+					})
+				}(batch)
 			}
+
+		case <-ticker.C:
+			if len(pending) == 0 {
+				continue
+			}
+			batch := pending
+			pending = make([]int, 0, 100)
+			go func(b []int) {
+				node.Send(nb.dest, map[string]any{
+					"type":    "broadcast_batch",
+					"message": batch,
+				})
+			}(batch)
+
 		}
-		mu.Unlock()
-		return n.Reply(msg, map[string]any{"type": "broadcast_ok"})
-	})
+	}
+}
 
-	n.Handle("read", func(msg maelstrom.Message) error {
-		return n.Reply(msg, map[string]any{"type": "read_ok", "messages": messages})
-	})
+type server struct {
+	sync.RWMutex
+	node      *maelstrom.Node
+	messages  []int
+	seen      set
+	neighbors []string
+	batchers  []*neighborBatcher
+}
 
-	n.Handle("topology", func(msg maelstrom.Message) error {
-		// Unmarshal the message body as a loosely-typed map.
-		var body map[string]any
-		if err := json.Unmarshal(msg.Body, &body); err != nil {
-			return err
+func (s *server) handleBroadcastOk(msg maelstrom.Message) error {
+	return nil
+}
+
+func (s *server) handleBroadcast(msg maelstrom.Message) error {
+	var body map[string]any
+	if err := json.Unmarshal(msg.Body, &body); err != nil {
+		return err
+	}
+
+	message := int(body["message"].(float64))
+	src := msg.Src
+
+	isNew := false
+	s.Lock()
+	_, exists := s.seen[message]
+	if !exists {
+		s.seen[message] = empty{}
+		s.messages = append(s.messages, message)
+		isNew = true
+	}
+	s.Unlock()
+
+	if isNew {
+		for i := range s.neighbors {
+			if s.neighbors[i] == src {
+				continue
+			}
+			s.batchers[i].messageChan <- message
 		}
+	}
 
-		topo := body["topology"].(map[string]any)
-		neighborsRaw := topo[n.ID()].([]any)
-		neighbors = make([]string, len(neighborsRaw))
+	return s.node.Reply(msg, map[string]any{"type": "broadcast_ok"})
+}
 
-		for i, v := range neighborsRaw {
-			neighbors[i] = v.(string)
+func (s *server) handleRead(msg maelstrom.Message) error {
+	s.RLock()
+	out := make([]int, len(s.messages))
+	copy(out, s.messages)
+	s.RUnlock()
+	return s.node.Reply(msg, map[string]any{"type": "read_ok", "messages": out})
+}
+
+func (s *server) handleTopology(msg maelstrom.Message) error {
+	allNodes := s.node.NodeIDs()
+	slices.Sort(allNodes)
+
+	bf := 4
+	idx := -1
+
+	for i, id := range allNodes {
+		if id == s.node.ID() {
+			idx = i
+			break
 		}
-		return n.Reply(msg, map[string]any{"type": "topology_ok"})
-	})
+	}
+
+	s.Lock()
+	s.neighbors = make([]string, 0, bf+1)
+	s.batchers = make([]*neighborBatcher, 0, bf+1)
+
+	if idx > 0 {
+		parent := (idx - 1) / bf
+		parentID := allNodes[parent]
+		s.neighbors = append(s.neighbors, parentID)
+		s.batchers = append(s.batchers, newNeighborBatcher(s.node, parentID))
+	}
+
+	for j := 1; j <= bf; j++ {
+		child := (idx * bf) + j
+		if child < len(allNodes) {
+			childID := allNodes[child]
+			s.neighbors = append(s.neighbors, childID)
+			s.batchers = append(s.batchers, newNeighborBatcher(s.node, childID))
+		}
+	}
+	s.Unlock()
+
+	return s.node.Reply(msg, map[string]any{"type": "topology_ok"})
+}
+
+func (s *server) handleBroadcastBatch(msg maelstrom.Message) error {
+	var body map[string]any
+	if err := json.Unmarshal(msg.Body, &body); err != nil {
+		return err
+	}
+	src := msg.Src
+
+	rawBatch := body["message"].([]any)
+
+	newMessages := make([]int, 0, len(rawBatch))
+
+	s.Lock()
+	for _, v := range rawBatch {
+		message := int(v.(float64))
+		_, exists := s.seen[message]
+		if !exists {
+			s.seen[message] = empty{}
+			s.messages = append(s.messages, message)
+			newMessages = append(newMessages, message)
+		}
+	}
+	s.Unlock()
+
+	for _, message := range newMessages {
+		for i := range s.neighbors {
+			if s.neighbors[i] == src {
+				continue
+			}
+			s.batchers[i].messageChan <- message
+		}
+	}
+
+	return s.node.Reply(msg, map[string]any{"type": "broadcast_ok"})
+}
+
+func main() {
+	s := &server{
+		node:     maelstrom.NewNode(),
+		messages: make([]int, 0, 100),
+		seen:     make(set),
+	}
+
+	s.node.Handle("broadcast_ok", s.handleBroadcastOk)
+	s.node.Handle("broadcast", s.handleBroadcast)
+	s.node.Handle("broadcast_batch", s.handleBroadcastBatch)
+	s.node.Handle("read", s.handleRead)
+	s.node.Handle("topology", s.handleTopology)
 
 	// Execute the node's message loop. This will run until STDIN is closed.
-	if err := n.Run(); err != nil {
+	if err := s.node.Run(); err != nil {
 		log.Fatal(err)
 		os.Exit(1)
 	}
