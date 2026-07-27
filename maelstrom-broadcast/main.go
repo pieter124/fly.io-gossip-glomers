@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"os"
@@ -19,52 +20,69 @@ type neighborBatcher struct {
 	messageChan chan int
 }
 
+type batchResult struct {
+	batch []int
+	ok    bool
+}
+
 func newNeighborBatcher(node *maelstrom.Node, dest string) *neighborBatcher {
-	nb := &neighborBatcher{dest: dest, messageChan: make(chan int, 32)}
+	nb := &neighborBatcher{dest: dest, messageChan: make(chan int, 1000)}
 	go nb.run(node)
 	return nb
 }
 
 func (nb *neighborBatcher) run(node *maelstrom.Node) {
-	ticker := time.NewTicker(10 * time.Millisecond)
+	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()
 
-	pending := make([]int, 0, 100)
+	unacked := make(set)
+	inFlight := make(set)
+	doneChan := make(chan batchResult)
 
 	for {
 		select {
 		case message := <-nb.messageChan:
-			pending = append(pending, message)
-			if len(pending) >= 32 {
-				batch := pending
-				pending = make([]int, 0, 100)
+			unacked[message] = empty{}
 
-				// Reset the ticker so we don't fire an empty batch right after
-				ticker.Reset(10 * time.Millisecond)
-
-				go func(b []int) {
-					node.Send(nb.dest, map[string]any{
-						"type":    "broadcast_batch",
-						"message": b,
-					})
-				}(batch)
+		case result := <-doneChan:
+			for _, msg := range result.batch {
+				delete(inFlight, msg)
+				if result.ok {
+					delete(unacked, msg)
+				}
 			}
 
 		case <-ticker.C:
-			if len(pending) == 0 {
+			toSend := make([]int, 0, len(unacked)*2)
+			for msg := range unacked {
+				if _, exists := inFlight[msg]; !exists {
+					toSend = append(toSend, msg)
+				}
+			}
+			if len(toSend) == 0 {
 				continue
 			}
-			batch := pending
-			pending = make([]int, 0, 100)
-			go func(b []int) {
-				node.Send(nb.dest, map[string]any{
-					"type":    "broadcast_batch",
-					"message": batch,
-				})
-			}(batch)
+			for _, msg := range toSend {
+				inFlight[msg] = empty{}
+			}
 
+			nb.sendBatch(toSend, doneChan, node)
 		}
 	}
+}
+
+func (nb *neighborBatcher) sendBatch(batch []int, doneChan chan batchResult, node *maelstrom.Node) {
+	go func(b []int) {
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		defer cancel()
+
+		_, err := node.SyncRPC(ctx, nb.dest, map[string]any{
+			"type":    "broadcast_batch",
+			"message": b,
+		})
+
+		doneChan <- batchResult{batch: b, ok: err == nil}
+	}(batch)
 }
 
 type server struct {
